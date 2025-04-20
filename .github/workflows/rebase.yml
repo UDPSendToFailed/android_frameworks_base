@@ -1,0 +1,145 @@
+name: Sync and Cherry-Pick (Skip if Unchanged)
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - local_branch: 'lineage-22.2'
+            upstream_repo_url: 'https://github.com/LineageOS/android_frameworks_base.git'
+            upstream_branch: 'lineage-22.2'
+            num_commits_to_pick: 3
+
+          - local_branch: 'crdroid-15.0'
+            upstream_repo_url: 'https://github.com/crdroidandroid/android_frameworks_base.git'
+            upstream_branch: '15.0'
+            num_commits_to_pick: 4
+
+    name: Sync ${{ matrix.local_branch }} (Last ${{ matrix.num_commits_to_pick }})
+    env:
+      NUM_COMMITS_TO_PICK: ${{ matrix.num_commits_to_pick }}
+
+    steps:
+      - name: Configure Git User
+        run: |
+          git config --global user.name 'GitHub Actions Bot'
+          git config --global user.email 'actions-bot@github.com'
+
+      - name: Get Current Upstream SHA
+        id: current_upstream
+        run: |
+          UPSTREAM_URL="${{ matrix.upstream_repo_url }}"
+          UPSTREAM_BRANCH="refs/heads/${{ matrix.upstream_branch }}"
+          echo "Getting current SHA for $UPSTREAM_URL branch $UPSTREAM_BRANCH"
+          CURRENT_SHA=$(git ls-remote $UPSTREAM_URL $UPSTREAM_BRANCH | cut -f1)
+          if [ -z "$CURRENT_SHA" ]; then
+            echo "::error::Could not get current upstream SHA for $UPSTREAM_BRANCH"
+            exit 1
+          fi
+          echo "sha=$CURRENT_SHA" >> $GITHUB_OUTPUT
+          echo "Current Upstream SHA: $CURRENT_SHA"
+
+      - name: Calculate Fetch Depth
+        id: calc_depth
+        run: |
+          FETCH_DEPTH=$(( ${{ env.NUM_COMMITS_TO_PICK }} + 1 ))
+          echo "fetch_depth=$FETCH_DEPTH" >> $GITHUB_OUTPUT
+
+      - name: Checkout Local Branch with Calculated Depth
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: ${{ matrix.local_branch }}
+          fetch-depth: ${{ steps.calc_depth.outputs.fetch_depth }}
+
+      - name: Get Assumed Last Sync SHA from Local History (HEAD~N)
+        id: last_sync_from_history
+        run: |
+          set -e
+          NUM_TO_SKIP="${{ env.NUM_COMMITS_TO_PICK }}"
+          DEEPEN_COUNT=$(( ${{ env.NUM_COMMITS_TO_PICK }} + 2 ))
+          echo "Getting SHA of commit before the last $NUM_TO_SKIP commits (HEAD~$NUM_TO_SKIP) on local branch ${{ matrix.local_branch }}"
+          git fetch origin ${{ matrix.local_branch }} --deepen="$DEEPEN_COUNT" || echo "Deepen fetch failed or unnecessary"
+          LAST_SHA=$(git rev-parse HEAD~$NUM_TO_SKIP)
+          echo "sha=$LAST_SHA" >> $GITHUB_OUTPUT
+          echo "Assumed Last Synced SHA (from HEAD~$NUM_TO_SKIP): $LAST_SHA"
+        env:
+          GIT_TERMINAL_PROMPT: 0
+
+      - name: Compare SHAs
+        id: comparison
+        run: |
+          CURRENT="${{ steps.current_upstream.outputs.sha }}"
+          LAST="${{ steps.last_sync_from_history.outputs.sha }}"
+          if [ "$CURRENT" == "$LAST" ]; then
+            echo "Upstream SHA ($CURRENT) matches assumed last sync SHA ($LAST). Skipping sync."
+            echo "proceed=false" >> $GITHUB_OUTPUT
+          else
+            echo "Upstream SHA has changed (Current: $CURRENT, Assumed Last: $LAST). Proceeding with sync."
+            echo "proceed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Fetch Full History and Upstream Commit
+        if: steps.comparison.outputs.proceed == 'true'
+        run: |
+          set -e
+          git fetch --unshallow origin || echo "Already full history or unshallow failed"
+          git remote add upstream ${{ matrix.upstream_repo_url }} || true
+          echo "Fetching upstream commit ${{ steps.current_upstream.outputs.sha }} and history..."
+          git fetch upstream ${{ steps.current_upstream.outputs.sha }} --no-tags
+        env:
+          GIT_TERMINAL_PROMPT: 0
+
+      - name: Create TEMP branch from Fetched Upstream Commit
+        if: steps.comparison.outputs.proceed == 'true'
+        run: |
+          set -e
+          echo "Creating TEMP branch from upstream commit ${{ steps.current_upstream.outputs.sha }}"
+          git checkout -B TEMP ${{ steps.current_upstream.outputs.sha }}
+
+      - name: Get Last Commit SHAs from Origin Branch
+        if: steps.comparison.outputs.proceed == 'true'
+        id: target_commits
+        run: |
+          set -e
+          LOCAL_BRANCH="${{ matrix.local_branch }}"
+          NUM_COMMITS="${{ env.NUM_COMMITS_TO_PICK }}"
+          echo "Getting last $NUM_COMMITS commits from origin/$LOCAL_BRANCH (HEAD)..."
+          git checkout $LOCAL_BRANCH
+          COMMIT_LIST=$(git log --reverse --format=%H --max-count=$NUM_COMMITS HEAD)
+          echo "commits_to_pick<<EOF" >> $GITHUB_OUTPUT
+          echo "$COMMIT_LIST" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "SHAs identified for cherry-pick:"
+          echo "$COMMIT_LIST"
+          git checkout TEMP
+
+      - name: Cherry-pick onto TEMP branch
+        if: steps.comparison.outputs.proceed == 'true' && steps.target_commits.outputs.commits_to_pick != ''
+        run: |
+          set -ex
+          echo "Cherry-picking identified commits onto TEMP..."
+          echo "${{ steps.target_commits.outputs.commits_to_pick }}" | while IFS= read -r commit_sha; do
+            if [ -n "$commit_sha" ]; then
+              echo "Attempting cherry-pick: $commit_sha"
+              git cherry-pick $commit_sha
+            fi
+          done
+          echo "Cherry-pick successful."
+        shell: bash
+
+      - name: Force Push TEMP to Origin Branch
+        if: steps.comparison.outputs.proceed == 'true'
+        run: |
+          set -e
+          echo "Force pushing TEMP branch to origin/${{ matrix.local_branch }}"
+          git push origin HEAD:${{ matrix.local_branch }} --force
+        env:
+          GIT_TERMINAL_PROMPT: 0
