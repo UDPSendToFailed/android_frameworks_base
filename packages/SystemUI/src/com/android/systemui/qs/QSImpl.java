@@ -72,7 +72,6 @@ import com.android.systemui.statusbar.policy.RemoteInputQuickSettingsDisabler;
 import com.android.systemui.statusbar.policy.SecureLockscreenQSDisabler;
 import com.android.systemui.tuner.TunerService;
 import com.android.systemui.util.Utils;
-import com.android.systemui.util.SystemUIBoostFramework;
 
 import dalvik.annotation.optimization.NeverCompile;
 
@@ -779,12 +778,6 @@ public class QSImpl implements QS, CommandQueue.Callbacks, StatusBarStateControl
             mQsMediaHost.setSquishFraction(mSquishinessFraction);
         }
         updateMediaPositions();
-        SystemUIBoostFramework sbf = SystemUIBoostFramework.getInstance();
-        if (expansion == 1.0f || expansion == 0.0f) {
-            sbf.animationBoostOff(SystemUIBoostFramework.REQUEST_ANIMATION_BOOST_TYPE_SPEED_UP_QS_EXPANSION_ANIMATION);
-        } else {
-            sbf.animationBoostOn(SystemUIBoostFramework.REQUEST_ANIMATION_BOOST_TYPE_SPEED_UP_QS_EXPANSION_ANIMATION);
-        }
     }
 
     private void setAlphaAnimationProgress(float progress) {
