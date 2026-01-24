@@ -56,25 +56,17 @@ public abstract class VerityUtils {
     private static final int HASH_SIZE_BYTES = 32;
 
     public static boolean isFsVeritySupported() {
-        return Build.VERSION.DEVICE_INITIAL_SDK_INT >= Build.VERSION_CODES.R;
+        return false;
     }
 
     /** Enables fs-verity for the file without signature. */
     public static void setUpFsverity(@NonNull String filePath) throws IOException {
-        int errno = enableFsverityNative(filePath);
-        if (errno != 0) {
-            throw new IOException("Failed to enable fs-verity on " + filePath + ": "
-                    + Os.strerror(errno));
-        }
+        return;
     }
 
     /** Enables fs-verity for an open file without signature. */
     public static void setUpFsverity(int fd) throws IOException {
-        int errno = enableFsverityForFdNative(fd);
-        if (errno != 0) {
-            throw new IOException("Failed to enable fs-verity on FD(" + fd + "): "
-                    + Os.strerror(errno));
-        }
+        return;
     }
 
     /** Returns whether the file has fs-verity enabled. */
