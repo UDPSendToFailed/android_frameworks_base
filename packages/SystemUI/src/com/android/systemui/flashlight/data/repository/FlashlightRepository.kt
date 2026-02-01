@@ -16,6 +16,7 @@
 
 package com.android.systemui.flashlight.data.repository
 
+import android.content.Context
 import android.content.pm.PackageManager
 import android.hardware.camera2.CameraAccessException
 import android.hardware.camera2.CameraCharacteristics
@@ -24,6 +25,7 @@ import android.hardware.camera2.CameraManager.TorchCallback
 import android.provider.Settings
 import com.android.systemui.CoreStartable
 import com.android.systemui.dagger.SysUISingleton
+import com.android.systemui.dagger.qualifiers.Application
 import com.android.systemui.dagger.qualifiers.Background
 import com.android.systemui.dump.DumpManager
 import com.android.systemui.flashlight.flags.FlashlightStrength
@@ -83,6 +85,7 @@ interface FlashlightRepository {
 class FlashlightRepositoryImpl
 @Inject
 constructor(
+    @Application private val context: Context,
     @Background private val bgScope: CoroutineScope,
     @Background private val bgDispatcher: CoroutineDispatcher,
     private val secureSettings: SecureSettingsRepository,
@@ -192,6 +195,26 @@ constructor(
      * @return the id of a connected camera that has flashlight, or null if none connected.
      * @throws CameraAccessException if the camera device have been disconnected
      */
+    private var samsungFlashlight: vendor.samsung_ext.hardware.camera.flashlight.IFlashlight? = null
+
+    private fun getSamsungFlashlight(): vendor.samsung_ext.hardware.camera.flashlight.IFlashlight? {
+        if (samsungFlashlight == null) {
+            val binder = android.os.ServiceManager.getService("vendor.samsung_ext.hardware.camera.flashlight.IFlashlight/default")
+            if (binder != null) {
+                samsungFlashlight = vendor.samsung_ext.hardware.camera.flashlight.IFlashlight.Stub.asInterface(binder)
+            }
+        }
+        return samsungFlashlight
+    }
+
+    private val userActionInteractor: FlashlightRepository by lazy { this }
+
+    /**
+     * Reads flashlight info from available [CameraCharacteristics]
+     *
+     * @return the id of a connected camera that has flashlight, or null if none connected.
+     * @throws CameraAccessException if the camera device have been disconnected
+     */
     private suspend fun loadFlashlightInfo(): String? =
         cameraManager.cameraIdList.firstOrNull { id ->
             val cc: CameraCharacteristics = cameraManager.getCameraCharacteristics(id)
@@ -206,8 +229,19 @@ constructor(
                     lensFacing == CameraCharacteristics.LENS_FACING_BACK
 
             if (backFlashlightAvailable) {
-                val default: Int? = cc.get(CameraCharacteristics.FLASH_INFO_STRENGTH_DEFAULT_LEVEL)
-                val max: Int? = cc.get(CameraCharacteristics.FLASH_INFO_STRENGTH_MAXIMUM_LEVEL)
+                val samsungHal = getSamsungFlashlight()
+                var default: Int? = cc.get(CameraCharacteristics.FLASH_INFO_STRENGTH_DEFAULT_LEVEL)
+                var max: Int? = cc.get(CameraCharacteristics.FLASH_INFO_STRENGTH_MAXIMUM_LEVEL)
+                
+                if (samsungHal != null) {
+                    max = 10
+                    // Read persisted level from SecureSettings
+                    val savedLevel = try {
+                        Settings.Secure.getInt(context.contentResolver, FLASHLIGHT_LEVEL_KEY, 1)
+                    } catch (e: Exception) { 1 }
+                    default = if (savedLevel in 1..10) savedLevel else 1
+                }
+
                 if (default != null) {
                     defaultEnabledLevelForUser[currentUserId] = default
                 }
@@ -222,83 +256,102 @@ constructor(
      *
      * TODO(B/412982015) try to reconnect on new subscriptions
      */
-    private val _state: Flow<FlashlightModel> = conflatedCallbackFlow {
-        val callbackFromSystem =
-            object : TorchCallback() {
-                override fun onTorchModeUnavailable(camId: String) {
-                    val currentFlashlightInfo = flashlightInfo.value
-                    if (
-                        currentFlashlightInfo is FlashlightInfo.Supported.LoadedSuccessfully &&
-                            camId == currentFlashlightInfo.cameraId
-                    ) {
-                        trySend(FlashlightModel.Unavailable.Temporarily.CameraInUse)
+    private val manualStateEvents = kotlinx.coroutines.flow.MutableSharedFlow<FlashlightModel>(
+        replay = 1,
+        onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST
+    )
+
+    private val _state: Flow<FlashlightModel> = kotlinx.coroutines.flow.merge(
+        conflatedCallbackFlow {
+            val callbackFromSystem =
+                object : TorchCallback() {
+                    override fun onTorchModeUnavailable(camId: String) {
+                        val currentFlashlightInfo = flashlightInfo.value
+                        if (
+                            currentFlashlightInfo is FlashlightInfo.Supported.LoadedSuccessfully &&
+                                camId == currentFlashlightInfo.cameraId
+                        ) {
+                            trySend(FlashlightModel.Unavailable.Temporarily.CameraInUse)
+                        }
+                    }
+
+                    override fun onTorchModeChanged(camId: String, enabled: Boolean) {
+                        val currentFlashlightInfo = flashlightInfo.value
+                        if (currentFlashlightInfo is FlashlightInfo.Supported.LoadedSuccessfully)
+                            if (camId == currentFlashlightInfo.cameraId) {
+                                if (currentFlashlightInfo.hasAdjustableLevels) {
+                                    val samsungHal = getSamsungFlashlight()
+                                    val brightness = if (enabled) {
+                                        if (samsungHal != null) {
+                                            try {
+                                                samsungHal.currentBrightness
+                                            } catch (e: Exception) {
+                                                logger.w("Error getting brightness from Samsung HAL: ${e.message}")
+                                                1
+                                            }
+                                        } else {
+                                            cameraManager.getTorchStrengthLevel(camId)
+                                        }
+                                    } else {
+                                        defaultEnabledLevelForUser.getOrPut(currentUserId) {
+                                            initialDefaultLevel
+                                        }
+                                    }
+                                    trySend(
+                                        FlashlightModel.Available.Level(
+                                            enabled,
+                                            brightness,
+                                            currentFlashlightInfo.maxLevel!!, // b/c hasAdjustableLevels
+                                        )
+                                    )
+                                } else {
+                                    trySend(FlashlightModel.Available.Binary(enabled))
+                                }
+                            } else {
+                                logger.w(
+                                    "onTorchModeChanged: saved camera id was" +
+                                        " ${currentFlashlightInfo.cameraId} but flashlight with" +
+                                        " camera id $camId called back."
+                                )
+                            }
+                    }
+
+                    /**
+                     * This callback does not shoot when torch is turned off and level goes back to
+                     * default in the backend.
+                     */
+                    override fun onTorchStrengthLevelChanged(camId: String, newStrengthLevel: Int) {
+                        val currentFlashlightInfo = flashlightInfo.value
+                        if (currentFlashlightInfo is FlashlightInfo.Supported.LoadedSuccessfully)
+                            if (camId == currentFlashlightInfo.cameraId) {
+                                if (currentFlashlightInfo.hasAdjustableLevels)
+                                    trySend(
+                                        FlashlightModel.Available.Level(
+                                            true, // this callback happens only when enabled
+                                            newStrengthLevel,
+                                            currentFlashlightInfo.maxLevel!!, // b/c hasAdjustableLevels
+                                        )
+                                    )
+                                else
+                                    logger.w(
+                                        "onTorchStrengthLevelChanged: One of the levels was" +
+                                            " null or max was below base level. default:${currentFlashlightInfo.defaultLevel}, max:${currentFlashlightInfo.maxLevel}"
+                                    )
+                            } else {
+                                logger.w(
+                                    "onTorchStrengthLevelChanged: saved camera id was" +
+                                        " ${currentFlashlightInfo.cameraId} but flashlight with" +
+                                        " camera id $camId called back."
+                                )
+                            }
                     }
                 }
 
-                override fun onTorchModeChanged(camId: String, enabled: Boolean) {
-                    val currentFlashlightInfo = flashlightInfo.value
-                    if (currentFlashlightInfo is FlashlightInfo.Supported.LoadedSuccessfully)
-                        if (camId == currentFlashlightInfo.cameraId) {
-                            if (currentFlashlightInfo.hasAdjustableLevels) {
-                                trySend(
-                                    FlashlightModel.Available.Level(
-                                        enabled,
-                                        if (enabled) {
-                                            cameraManager.getTorchStrengthLevel(camId)
-                                        } else {
-                                            defaultEnabledLevelForUser.getOrPut(currentUserId) {
-                                                initialDefaultLevel
-                                            }
-                                        },
-                                        currentFlashlightInfo.maxLevel!!, // b/c hasAdjustableLevels
-                                    )
-                                )
-                            } else {
-                                trySend(FlashlightModel.Available.Binary(enabled))
-                            }
-                        } else {
-                            logger.w(
-                                "onTorchModeChanged: saved camera id was" +
-                                    " ${currentFlashlightInfo.cameraId} but flashlight with" +
-                                    " camera id $camId called back."
-                            )
-                        }
-                }
-
-                /**
-                 * This callback does not shoot when torch is turned off and level goes back to
-                 * default in the backend.
-                 */
-                override fun onTorchStrengthLevelChanged(camId: String, newStrengthLevel: Int) {
-                    val currentFlashlightInfo = flashlightInfo.value
-                    if (currentFlashlightInfo is FlashlightInfo.Supported.LoadedSuccessfully)
-                        if (camId == currentFlashlightInfo.cameraId) {
-                            if (currentFlashlightInfo.hasAdjustableLevels)
-                                trySend(
-                                    FlashlightModel.Available.Level(
-                                        true, // this callback happens only when enabled
-                                        newStrengthLevel,
-                                        currentFlashlightInfo.maxLevel!!, // b/c hasAdjustableLevels
-                                    )
-                                )
-                            else
-                                logger.w(
-                                    "onTorchStrengthLevelChanged: One of the levels was" +
-                                        " null or max was below base level. default:${currentFlashlightInfo.defaultLevel}, max:${currentFlashlightInfo.maxLevel}"
-                                )
-                        } else {
-                            logger.w(
-                                "onTorchStrengthLevelChanged: saved camera id was" +
-                                    " ${currentFlashlightInfo.cameraId} but flashlight with" +
-                                    " camera id $camId called back."
-                            )
-                        }
-                }
-            }
-
-        cameraManager.registerTorchCallback(bgDispatcher.asExecutor(), callbackFromSystem)
-        awaitClose { cameraManager.unregisterTorchCallback(callbackFromSystem) }
-    }
+            cameraManager.registerTorchCallback(bgDispatcher.asExecutor(), callbackFromSystem)
+            awaitClose { cameraManager.unregisterTorchCallback(callbackFromSystem) }
+        },
+        manualStateEvents
+    )
 
     /**
      * The only place this repo diverges from the [CameraManager.getTorchStrengthLevel] API, when
@@ -363,14 +416,56 @@ constructor(
             try {
                 if (enabled != currentState.enabled) {
                     if (currentFlashlightInfo.hasAdjustableLevels && enabled) {
-                        cameraManager.turnOnTorchWithStrengthLevel(
-                            currentFlashlightInfo.cameraId,
-                            defaultEnabledLevelForUser.getOrPut(currentUserId) {
-                                initialDefaultLevel
-                            },
-                        )
+                        val samsungHal = getSamsungFlashlight()
+                        if (samsungHal != null) {
+                            try {
+                                val level = defaultEnabledLevelForUser.getOrPut(currentUserId) {
+                                    initialDefaultLevel
+                                }
+                                samsungHal.setBrightness(level)
+                                manualStateEvents.emit(
+                                    FlashlightModel.Available.Level(
+                                        true, 
+                                        level, 
+                                        currentFlashlightInfo.maxLevel!!
+                                    )
+                                )
+                            } catch (e: Exception) {
+                                logger.w("Samsung HAL error: ${e.message}")
+                            }
+                        } else {
+                            cameraManager.turnOnTorchWithStrengthLevel(
+                                currentFlashlightInfo.cameraId,
+                                defaultEnabledLevelForUser.getOrPut(currentUserId) {
+                                    initialDefaultLevel
+                                },
+                            )
+                        }
                     } else {
-                        cameraManager.setTorchMode(currentFlashlightInfo.cameraId, enabled)
+                        val samsungHal = getSamsungFlashlight()
+                        if (samsungHal != null) {
+                            try {
+                                samsungHal.enableFlash(enabled)
+                                // Handle disable case
+                                val level = defaultEnabledLevelForUser.getOrPut(currentUserId) {
+                                    initialDefaultLevel
+                                }
+                                manualStateEvents.emit(
+                                    if (currentFlashlightInfo.hasAdjustableLevels)
+                                        FlashlightModel.Available.Level(
+                                            false, 
+                                            level, 
+                                            currentFlashlightInfo.maxLevel!!
+                                        )
+                                    else
+                                        FlashlightModel.Available.Binary(false)
+                                )
+                            } catch (e: Exception) {
+                                logger.w("Samsung HAL error: ${e.message}")
+                            }
+                        } else {
+                            cameraManager.setTorchMode(currentFlashlightInfo.cameraId, enabled)
+                        }
                     }
                 }
             } catch (e: CameraAccessException) {
@@ -404,10 +499,32 @@ constructor(
 
             try {
                 if (level != currentState.level) {
-                    cameraManager.turnOnTorchWithStrengthLevel(currentInfo.cameraId, level)
+                    val samsungHal = getSamsungFlashlight()
+                    if (samsungHal != null) {
+                         try {
+                              samsungHal.setBrightness(level)
+                              manualStateEvents.emit(
+                                    FlashlightModel.Available.Level(
+                                        true, 
+                                        level, 
+                                        currentInfo.maxLevel!!
+                                    )
+                              )
+                         } catch (e: Exception) {
+                              logger.w("Samsung HAL error: ${e.message}")
+                         }
+                    } else {
+                        cameraManager.turnOnTorchWithStrengthLevel(currentInfo.cameraId, level)
+                    }
                 }
                 if (persist) {
                     defaultEnabledLevelForUser[currentUserId] = level
+                    // Persist to SecureSettings
+                    try {
+                        Settings.Secure.putInt(context.contentResolver, FLASHLIGHT_LEVEL_KEY, level)
+                    } catch (e: Exception) {
+                        logger.w("Failed to persist flashlight level: ${e.message}")
+                    }
                 }
             } catch (e: CameraAccessException) {
                 e.printStackTrace()
@@ -440,6 +557,7 @@ constructor(
 
     private companion object {
         private const val BASE_TORCH_LEVEL = 1
+        private const val FLASHLIGHT_LEVEL_KEY = "flashlight_strength_level"
         private val RECONNECT_COOLDOWN = 30.seconds
         private val RECONNECT_TIMEOUT = 2.seconds
     }
