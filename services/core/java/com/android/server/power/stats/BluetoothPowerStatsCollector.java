@@ -177,8 +177,9 @@ public class BluetoothPowerStatsCollector extends PowerStatsCollector {
 
                     @Override
                     public void onBluetoothActivityEnergyInfoError(int error) {
-                        immediateFuture.completeExceptionally(
-                                new RuntimeException("error: " + error));
+                        // Legacy HALs on 3.18 don't support energy info.
+                        // Return null to exit gracefully instead of crashing the thread.
+                        immediateFuture.complete(null);
                     }
                 });
 
