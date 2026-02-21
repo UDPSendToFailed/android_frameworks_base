@@ -1144,11 +1144,18 @@ class DesktopRepository(
                 }
             }
         }
-        if (
-            DesktopModeFlags.ENABLE_DESKTOP_WINDOWING_PERSISTENCE.isTrue &&
-                DesktopExperienceFlags.ENABLE_MULTIPLE_DESKTOPS_BACKEND.isTrue
-        ) {
+        if (DesktopModeFlags.ENABLE_DESKTOP_WINDOWING_PERSISTENCE.isTrue) {
             if (DesktopExperienceFlags.REPOSITORY_BASED_PERSISTENCE.isTrue) {
+                persistentUpdateQueue.post {
+                    try {
+                        persistentRepository.removeDesktop(userId, desk.deskId)
+                    } catch (exception: Exception) {
+                        logE(
+                            "An exception occurred while removing desk from persistent repository \n%s",
+                            exception.stackTrace,
+                        )
+                    }
+                }
                 updatePersistentRepository(desk.displayId)
             } else {
                 removeDeskFromPersistentRepository(desk)

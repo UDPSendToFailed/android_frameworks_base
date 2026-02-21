@@ -132,6 +132,8 @@ class DesksTransitionObserver(
             finishedDeskTransitions.forEach { deskTransition ->
                 if (deskTransition is DeskTransition.DeactivateDesk) {
                     handleDeactivateDeskTransition(null, deskTransition)
+                } else if (deskTransition is DeskTransition.RemoveDesk) {
+                    handleRemoveDeskTransition(deskTransition)
                 } else {
                     logW(
                         "Unexpected desk transition finished without being handled: %s",
@@ -146,19 +148,7 @@ class DesksTransitionObserver(
         logD("Desk transition ready: %s", deskTransition)
         val repository = desktopUserRepositories.getProfile(deskTransition.userId)
         when (deskTransition) {
-            is DeskTransition.RemoveDesk -> {
-                // TODO: b/362720497 - consider verifying the desk was actually removed through the
-                //  DesksOrganizer. The transition info won't have changes if the desk was not
-                //  visible, such as when dismissing from Overview.
-                val deskId = deskTransition.deskId
-                val displayId = deskTransition.displayId
-                deskTransition.runOnTransitEnd?.invoke()
-                if (repository.isDeskActive(deskTransition.deskId)) {
-                    desktopModeEventLogger.logPendingSessionExit(deskId, deskTransition.exitReason)
-                }
-                repository.removeDesk(deskTransition.deskId)
-                deskTransition.onDeskRemovedListener?.onDeskRemoved(displayId, deskId)
-            }
+            is DeskTransition.RemoveDesk -> handleRemoveDeskTransition(deskTransition)
             is DeskTransition.ActivateDesk -> {
                 val activateDeskChange =
                     info.changes.find { change ->
@@ -233,6 +223,22 @@ class DesksTransitionObserver(
             is DeskTransition.RemoveDisplay -> handleRemoveDisplay(deskTransition)
             is DeskTransition.AddTaskToDesk -> handleAddTaskToDesk(deskTransition)
         }
+    }
+
+    private fun handleRemoveDeskTransition(deskTransition: DeskTransition.RemoveDesk) {
+        logD("handleRemoveDeskTransition: %s", deskTransition)
+        val repository = desktopUserRepositories.getProfile(deskTransition.userId)
+        // TODO: b/362720497 - consider verifying the desk was actually removed through the
+        //  DesksOrganizer. The transition info won't have changes if the desk was not
+        //  visible, such as when dismissing from Overview.
+        val deskId = deskTransition.deskId
+        val displayId = deskTransition.displayId
+        deskTransition.runOnTransitEnd?.invoke()
+        if (repository.isDeskActive(deskId)) {
+            desktopModeEventLogger.logPendingSessionExit(deskId, deskTransition.exitReason)
+        }
+        repository.removeDesk(deskId)
+        deskTransition.onDeskRemovedListener?.onDeskRemoved(displayId, deskId)
     }
 
     private fun handleDeactivateDeskTransition(
