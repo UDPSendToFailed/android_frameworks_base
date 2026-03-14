@@ -30,5 +30,7 @@
 
     <LinearLayout
         android:id="@android:id/widget_frame"
+        android:layout_width="wrap_content"
+        android:layout_height="match_parent"
         style="?expressiveTwoTargetPreferenceWidgetFrameStyle" />
 </com.android.settingslib.widget.DrawableStateLinearLayout>

@@ -18,10 +18,18 @@
 <LinearLayout
     xmlns:android="http://schemas.android.com/apk/res/android"
     android:id="@+id/two_target_divider"
+    android:layout_width="wrap_content"
+    android:layout_height="match_parent"
     android:filterTouchesWhenObscured="false"
     style="?expressiveTwoTargetDividerStyle">
 
-    <ImageView style="?expressiveTwoTargetDividerImageViewStyle" />
+    <ImageView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        style="?expressiveTwoTargetDividerImageViewStyle" />
 
-    <View style="?expressiveTwoTargetDividerViewStyle" />
+    <View
+        android:layout_width="1dp"
+        android:layout_height="40dp"
+        style="?expressiveTwoTargetDividerViewStyle" />
 </LinearLayout>
